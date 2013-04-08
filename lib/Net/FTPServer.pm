@@ -53,6 +53,7 @@ Current features include:
  * Directory aliases and CDPATH support.
  * Extensible command set.
  * Generate archives on the fly.
+ * SSL/TLS security (from patch provided in issue 29530 of CPAN - BRONG)
 
 =head1 INSTALLING AND RUNNING THE SERVER
 
@@ -384,6 +385,16 @@ Default: 255
 
 Example: C<max clients: 600>
 
+=item max clients_per_ip
+
+Limit on the number of simultaneous connections
+someone may have from an particular IP address.
+Will deny on the accept. Works in daemon mode only.
+
+Default: 12
+
+Example: C<max clients_per_ip: 10>
+
 =item max clients message
 
 Message to display when ``max clients'' has been reached.
@@ -447,6 +458,7 @@ Possible greeting types are:
     brief    Hostname only.
     terse    Nothing
     text     Display greeting from ``greeting text'' option.
+    hook     Use the ``greeting_hook''
 
 The SITE VERSION command can also reveal the version number. You
 may need to turn this off by setting C<allow site version command: 0>
@@ -652,8 +664,28 @@ Allow the FTP server to connect back to ports E<lt> 1024. This is rarely
 useful and could pose a serious security hole in some circumstances.
 
 Default: 0
-
+ 
 Example: C<allow connect low port: 1>
+
+=item require passive data connection
+
+Requires data connections to be initiated by the client. It's 
+increasingly not possible for servers to connect back to the client to 
+initiate the data connection, as firewalls prevent this. All modern FTP
+clients support passive data connections.
+
+Default: 0
+
+Example: C<require passive data connection: 1>
+
+=item enable log4perl
+
+Use log4perl for logging output from the daemon.
+
+Default: 0
+
+Example: C<enable log4perl: 1>
+
 
 =item passive port range
 
@@ -860,6 +892,30 @@ clear, syslogging is disabled.
 Default: 1
 
 Example: C<enable syslog: 0>
+
+=item enable ssl
+
+Enable ssl/tls encryption.  Requires IO::Socket::SSL to be
+installed.  Turning this on will cause AUTH TLS to be
+advertised via FEAT.
+
+This SSL mode is compatible with RFC4217 clients, where it
+is often called "Explicit FTPS".  You will need to give an
+SSL certificate and key pair.
+
+Default: 0
+
+Example: C<enable ssl: 1>
+
+=item ssl cert file
+=item ssl key file
+
+Paths to the key and certificate files for SSL.
+
+There is no default.
+
+Example: C<ssl cert file: /etc/ssl/server.crt>
+Example: C<ssl key file: /etc/ssl/server.key>
 
 =item ident timeout
 
@@ -1586,8 +1642,7 @@ file:
            $Net::FTPServer::VERSION >= 1.025;
   </Perl>
 
-=back
-
+=back 
 =head2 LOADING CUSTOMIZED SITE COMMANDS
 
 It is very simple to write custom SITE commands. These
@@ -1768,12 +1823,11 @@ C<SITE SHOW> command:
 
   ftp> site show README
   200-File README:
-  200-README
-  200-======
+  200-$Id: FTPServer.pm,v 1.11 2005/07/15 10:10:22 rwmj Exp $
   200-
-  200-Biblio@Tech Net::FTPServer - A full-featured, secure, extensible
+  200-Net::FTPServer - A secure, extensible and configurable Perl FTP server.
   [...]
-  200-Copyright (C) 2000-2003 Richard Jones <rich@annexia.org> and other contributors.
+  200-To contact the author, please email: Richard Jones <rich@annexia.org>
   200 End of file.
 
 =head2 STANDARD PERSONALITIES
@@ -2178,6 +2232,9 @@ eval "use Archive::Zip;";
 eval "use BSD::Resource;";
 eval "use Digest::MD5;";
 eval "use File::Sync;";
+eval "use IO::Socket::SSL";
+eval "use Log::Log4perl;";
+eval "use Log::Log4perl::Level;";
 
 # Global variables and constants.
 use vars qw(@_default_commands
@@ -2209,6 +2266,10 @@ use vars qw(@_default_commands
      "CLNT",
      # Experimental IP-less virtual hosting.
      "HOST",
+     # RFC4217 TLS AUTH (subset of RFC 2228)
+     "AUTH", "PBSZ", "PROT", "CCC",
+     # FROM RFC 2428
+     "EPSV", "EPRT",
     );
 
 @_default_site_commands
@@ -2237,8 +2298,6 @@ $GOT_SIGHUP  = 0;
 $GOT_SIGTERM = 0;
 
 =pod
-
-=over 4
 
 =item Net::FTPServer->run ([\@ARGV]);
 
@@ -2317,6 +2376,20 @@ sub run
 
     $self->post_configuration_hook;
 
+    # include TLS features if SSL support available
+    if ($self->config("enable ssl"))
+       {
+         $self->{features}{AUTH} = 'TLS';
+         $self->{features}{PBSZ} = undef;
+         $self->{features}{PROT} = undef;
+         $self->{features}{CCC} = undef;
+       }
+ 
+    # find the public IP address
+    if ($self->config ("public ip address")) {
+	  $self->{public_ip_address} = _determine_public_ipaddress($self->config ("public ip address"));
+	  warn "public ip address set to " . $self->{public_ip_address};
+    }
     # Initialize Max Clients Settings
     $self->{_max_clients} =
       $self->config ("max clients") || 255;
@@ -2324,11 +2397,27 @@ sub run
       $self->config ("max clients message") ||
 	"Maximum connections reached";
 
+    # Initialize Max Clients Settings
+    $self->{_max_clients_per_ip} =
+      $self->config ("max clients_per_ip") || 12;
+    $self->{_max_clients_per_ip_message} =
+      $self->config ("max clients_per_ip message") ||
+      "Sorry, maximum connections from \%R reached [\%y]";
+
     # Open syslog.
     $self->{_enable_syslog} =
       (!defined $self->config ("enable syslog") ||
        $self->config ("enable syslog")) &&
       !$self->{_test_mode};
+
+    # Enable log4perl
+    $self->{_enable_log4perl} =
+      ($self->config ("enable log4perl")) && !$self->{_test_mode} && exists $INC{"Log/Log4Perl.pm"};
+
+    if ($self->{_enable_log4perl})
+      {
+	  Log::Log4perl->init($self->config("enable log4perl"));
+      }
 
     if ($self->{_enable_syslog})
       {
@@ -2476,7 +2565,7 @@ sub run
       {
 	$self->log ("info", "get socket name") if $self->{debug};
 
-	$sockname = getsockname STDIN;
+    	$sockname = getsockname STDIN;
 	if (!defined $sockname)
 	  {
 	    $self->reply(500, "inet mode requires a socket - use '$0 -S' for standalone.");
@@ -2490,8 +2579,7 @@ sub run
 	setsockopt (STDIN, SOL_SOCKET, SO_OOBINLINE, pack ("l", 1))
 	  or warn "setsockopt: SO_OOBINLINE: $!";
 
-	# Note by RWMJ: The following code always generates an error, so
-	# I have commented it out for the present.
+	# Note by RWMJ: The following code always generates an error, so I have commented it out for the present.
 	#my $pid = pack ("l", $$);
 	#fcntl (STDIN, F_SETOWN, $pid)
 	#  or warn "fcntl: F_SETOWN $$: $!";
@@ -2557,6 +2645,7 @@ sub run
     $self->_log_line ("[CONNECTION FROM $peeraddrstring:$peerport] \#".
 		      (1 + $self->concurrent_connections));
 
+    #
     # Resolve the address.
     my $peerhostname;
     if ($self->config ("resolve addresses"))
@@ -2698,7 +2787,7 @@ sub run
 	    "$peerhostname:$peerport ($peeraddrstring:$peerport)" :
 	    "$peeraddrstring:$peerport";
 
-	$self->log ("info", "connection from $peerinfodpy");
+	$self->log ("info", "client - connection from $peerinfodpy");
 
 	# Change name of process in process listing.
 	unless (defined $self->config ("change process name") &&
@@ -2727,6 +2816,11 @@ sub run
       {
 	my $greeting_text = $self->config ("greeting text")
 	  or die "greeting type is text, but no greeting text configuration value";
+	$self->reply (220, $greeting_text);
+      }
+    elsif ($greeting_type eq "hook")
+      {
+	my $greeting_text =  $self->greeting_hook();
 	$self->reply (220, $greeting_text);
       }
     else
@@ -2855,7 +2949,9 @@ sub run
       {
 	%no_authentication_commands =
 	  ("USER" => 1, "PASS" => 1, "LANG" => 1, "FEAT" => 1,
-	   "HELP" => 1, "QUIT" => 1, "HOST" => 1);
+	   "HELP" => 1, "QUIT" => 1, "HOST" => 1,
+	   "AUTH" => 1, "PBSZ" => 1, "PROT" => 1, "CCC" => 1,
+	  );
       }
 
     # Start reading commands from the client.
@@ -2872,7 +2968,7 @@ sub run
 	# XXX This does not comply properly with RFC 2640 section 3.1 -
 	# We should translate <CR><NUL> to <CR> and treat ONLY <CR><LF>
 	# as a line ending character.
-	last unless defined ($_ = <STDIN>);
+	last unless defined ($_ = $self->{_sock}->getline());
 
 	$self->_check_signals;
 
@@ -2973,7 +3069,7 @@ sub run
 	my ($cmd, $rest) = (uc $1, $2);
 
 	$self->log ("info", "command: (%s, %s)",
-		    _escape ($cmd), _escape ($rest))
+		    _escape ($cmd) , ((_escape($cmd) eq 'PASS') ? 'REDACTED' : _escape ($rest)))
 	  if $self->{debug};
 
 	# Command requires user to be authenticated?
@@ -3072,6 +3168,9 @@ sub _handle_sigchld
     while ((my $pid = waitpid (-1, WNOHANG)) > 0)
       {
 	# Remove this PID from the children hash.
+	my $psockaddrstring = $self->{_children}->{$pid}->{_ip_address};
+	$self->{_children_by_ip}->{$psockaddrstring} -= 1;
+	$self->log("debug", "reap child from $psockaddrstring : $self->{_children_by_ip}->{$psockaddrstring}");
 	delete $self->{_children}->{$pid};
       }
   }
@@ -3267,7 +3366,7 @@ sub _set_rlimit
 	setrlimit (&{$ {BSD::Resource::}{$name}}, $value, $value)
 	  or die "setrlimit: $!";
       }
-    elsif (not $ENV{NET_FTPSERVER_NO_BSD_RESOURCE_WARNING})
+    else
       {
 	warn
 	  "Resource limit $name cannot be set. This may be because ",
@@ -3501,6 +3600,8 @@ sub _be_daemon
     # Initialize the children hash ref for max clients enforcement
     $self->{_children} = {};
 
+    $self->{_children_by_ip} = {}; # keep track of # of connections by IP Address
+
     $self->post_bind_hook;
 
     # Accept new connections and fork off new process to handle it.
@@ -3548,6 +3649,10 @@ sub _be_daemon
 	# Possibly rotate the log files to a new name.
 	$self->_rotate_log ;
 
+    my $psockaddrstring = peer_ip_for_socket($sock);
+
+    $self->log("warn","Connection from peer [ $psockaddrstring ] \n");
+
 	if ($self->concurrent_connections >= $self->{_max_clients})
 	  {
 	    $sock->print ("500 ".
@@ -3558,6 +3663,23 @@ sub _be_daemon
 	    $self->_log_line ("[Max connections $self->{_max_clients} reached]");
 	    next;
 	  }
+
+    # see how many clients we have going.
+
+    if (defined $self->{_children_by_ip}->{$psockaddrstring} && ($self->{_children_by_ip}->{$psockaddrstring} >= $self->{_max_clients_per_ip} ))
+     {
+       $self->{peeraddrstring} = $psockaddrstring;
+       $self->log("warn","Max connections from $psockaddrstring reached [$self->{_max_clients_per_ip}]");
+       $sock->print ("500 ".
+       			  $self->_percent_substitutions($self->{_max_clients_per_ip_message}).
+       			  "\r\n");
+       	    $sock->close;
+       	    warn "Max connections from $psockaddrstring $self->{_max_clients_per_ip} reached!";
+       	    $self->_log_line ("[Max connections from $psockaddrstring $self->{_max_clients_per_ip} reached]");
+       	    next;
+     }
+
+
 
 	# Fork off a process to handle this connection.
 	my $pid = fork;
@@ -3594,11 +3716,13 @@ sub _be_daemon
 
 		# Duplicate the socket so it looks like we were called
 		# from inetd.
+                $self->{_sock} = $sock;
 		dup2 ($sock->fileno, 0);
 		dup2 ($sock->fileno, 1);
 
 		# Return to the main process to handle the rest of
 		# the connection.
+		srand(time ^ $$ ^ unpack("%32L*", `ps axww | gzip -f`)); # avoid issues tempfile
 		return;
 	      }			# End of child process.
 	  }
@@ -3610,8 +3734,14 @@ sub _be_daemon
 
 	# A child has been successfully spawned.
 	# So don't forget the kid's birthday!
-	$self->{_children}->{$pid} = time;
-      }				# End of for (;;) loop in ftpd parent process.
+
+	$self->{_children}->{$pid}->{_birthday} = time;
+    if ($psockaddrstring) {
+            $self->{_children}->{$pid}->{_ip_address} = $psockaddrstring;
+            $self->{_children_by_ip}->{$psockaddrstring} += 1;
+            $self->log("debug", "connect from $psockaddrstring : $self->{_children_by_ip}->{$psockaddrstring}");
+        }
+    }				# End of for (;;) loop in ftpd parent process.
   }
 
 sub concurrent_connections
@@ -3639,7 +3769,14 @@ sub concurrent_connections
 	return 1;
       }
   }
+ sub peer_ip_for_socket
+    {
+        my $sock = shift;
+        my $peer_address = $sock->peerhost();
 
+
+        return $peer_address;
+    }
 # Open configuration file and prepare to read configuration.
 
 sub _open_config_file
@@ -3960,15 +4097,15 @@ sub reply
 
     if (@_ == 1)		# Single-line response.
       {
-	print $code, " ", $_[0], "\r\n";
+	$self->{_sock}->print($code, " ", $_[0], "\r\n");
       }
     else			# Multi-line response.
       {
 	for (my $i = 0; $i < @_-1; ++$i)
 	  {
-	    print $code, "-", $_[$i], "\r\n";
+	    $self->{_sock}->print($code, "-", $_[$i], "\r\n");
 	  }
-	print $code, " ", $_[@_-1], "\r\n";
+	$self->{_sock}->print($code, " ", $_[@_-1], "\r\n");
       }
 
     $self->log ("info", "reply: $code") if $self->{debug};
@@ -3987,8 +4124,19 @@ Use this function instead of calling C<syslog> directly.
 sub log
   {
     my $self = shift;
-
+    
     Sys::Syslog::syslog @_ if $self->{_enable_syslog};
+    if ($self->{_enable_log4perl}) {
+	my %pxlate=('info'=>$INFO,'warn'=>$WARN,'err'=>$ERROR, 'error'=>$ERROR, 'notice'=>$INFO,'debug'=>$DEBUG, 'trace'=>$TRACE);
+      my $level = shift @_;
+      my $logger = Log::Log4perl->get_logger('daemon.ftpd');
+
+      #my $package; my $filename; my $line;
+      #($package, $filename, $line) = caller;
+      #print STDERR sprintf("%s %s %s\n",$package, $filename, $line);
+
+      $logger->log($pxlate{$level},sprintf(shift @_,@_));
+    }
   }
 
 =pod
@@ -4230,7 +4378,7 @@ sub _archive_generator_zip
 
 		 $zip->addMember ($memb);
 		 $memb->desiredCompressionMethod
-		   (&Archive::Zip::COMPRESSION_DEFLATED);
+		   (&{$ {Archive::Zip::}{COMPRESSION_DEFLATED}});
 		 $memb->desiredCompressionLevel (9);
 	       }
 	 },
@@ -4262,7 +4410,7 @@ sub _archive_generator_zip
 	if ($file)
 	  {
 	    unlink $tmpname;
-	    $zip->writeToFileHandle ($file, 1) == &Archive::Zip::AZ_OK
+	    $zip->writeToFileHandle ($file, 1) == &{$ {Archive::Zip::}{AZ_OK}}
 	      or die "failed to write to zip file: $!";
 	    $file->seek (0, 0);
 	  }
@@ -4271,7 +4419,7 @@ sub _archive_generator_zip
     unless ($file)
       {
 	$file = new IO::Scalar;
-	$zip->writeToFileHandle ($file, 1) == &Archive::Zip::AZ_OK
+	$zip->writeToFileHandle ($file, 1) == &{$ {Archive::Zip::}{AZ_OK}}
 	  or die "failed to write to zip file: $!";
 	$file->seek (0, 0);
       }
@@ -4389,6 +4537,141 @@ sub _HOST_command
     $self->reply (200, "HOST set to $self->{sitename}.");
   }
 
+sub _AUTH_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    my $ucr = uc($rest);
+
+    # If the user issues this command when logged in, generate an error.
+    # We have to do this basically because of chroot and setuid stuff we
+    # can't ``relogin'' as a different user.
+    if ($self->{authenticated})
+      {
+	    $self->reply (503, "You are already logged in.");
+	    return;
+      }
+
+    if ($self->{user}) 
+      {
+	    $self->reply (503, "You have already sent a USER command, too late to switch now.");
+	    return;
+      }
+
+    if ($ucr ne 'TLS' and $ucr ne 'SSL')
+      {
+	    $self->reply (504, "Mechanism not known here.");
+	    return;
+      }
+
+    if (not $self->config("enable ssl")) 
+      {
+	    $self->reply (534, "SSL is not enabled on this server.");
+      }
+
+    if (not exists $INC{"IO/Socket/SSL.pm"}) 
+      {
+	    $self->reply (431, "IO::Socket::SSL is not installed, unable to encrypt.");
+      }
+
+    # Accept the TLS session.
+    $self->reply (234, "AUTH=$ucr");
+    my $cert = $self->config("ssl cert file") || $self->config("ssl certificate file");
+    my $key = $self->config("ssl key file");
+    if (IO::Socket::SSL->start_SSL($self->{_sock}, 
+				   SSL_server => 1, 
+				   SSL_cert_file => $cert,
+				   SSL_key_file => $key,
+				  ))
+      {
+	$self->{tls_control} = 1;
+	$self->{tls_type} = $ucr;
+      }
+    else
+      {
+	# failed, what can we do?
+	die "Failed to start TLS " . IO::Socket::SSL::errstr();
+      }
+  }
+
+sub _PBSZ_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    if (!$self->{tls_control}) 
+      {
+	$self->reply (503, "Control connection is not protected");
+	return;
+      }
+
+    if ($rest != 0) 
+      {
+	$self->reply (501, "Size must be 0 for TLS"); 
+	return;
+      }
+
+    $self->{pbsz_provided} = 1;
+    $self->reply (200, "PBSZ=0");
+  }
+
+sub _PROT_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    my $ucr = uc($rest);
+
+    if (!$self->{tls_control}) 
+      {
+	$self->reply (503, "Control connection is not protected");
+	return;
+      }
+
+    if (!$self->{pbsz_provided})
+      {
+	$self->reply (503, "Pointless block size command has not been issued");
+	return;
+      }
+
+    if ($ucr ne 'C' and $ucr ne 'P')
+      {
+	$self->reply (536, "TLS only supports P and C");
+	return;
+      }
+
+    $self->{tls_data} = ($ucr eq 'P');
+    $self->reply (200, "PROT=$ucr");
+  }
+
+sub _CCC_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    if (!$self->{tls_control}) 
+      {
+	$self->reply (503, "Control connection is not protected");
+	return;
+      }
+
+    if ($self->{_sock}->can('stop_SSL')) 
+      {
+	$self->reply (200, "CCC");
+	$self->{_sock}->stop_SSL();
+	$self->{tls_control} = 0;
+      }
+    else
+      {
+	$self->reply(534, "Unable to shut down TLS on this connection");
+      }
+  }
+
 sub _USER_command
   {
     my $self = shift;
@@ -4456,6 +4739,15 @@ sub _PASS_command
 
     # If this is an anonymous login, check that the password conforms.
     my @anon_passwd_warning = ();
+    my @not_encrypted_warning = ();
+
+    unless ($self->{tls_control})
+	{
+	    push @not_encrypted_warning,
+	    "This connection is not encrypted.",
+	    "Please use an SSL/TLS enabled ftp",
+	    "client for enhanced security.";
+        }
 
     if ($self->{user_is_anonymous})
       {
@@ -4587,13 +4879,13 @@ sub _PASS_command
 	if (! $self->{user_is_anonymous})
 	  {
 	    $self->reply (230,
-			  @anon_passwd_warning,
+			  @anon_passwd_warning,@not_encrypted_warning,
 			  "Welcome " . $self->{user} . ".");
 	  }
 	else
 	  {
 	    $self->reply (230,
-			  @anon_passwd_warning,
+			  @anon_passwd_warning,@not_encrypted_warning,
 			  "Welcome $rest.");
 	  }
       }
@@ -4605,7 +4897,7 @@ sub _PASS_command
 	$welcome_text = $self->_percent_substitutions ($welcome_text);
 
 	$self->reply (230,
-		      @anon_passwd_warning,
+		      @anon_passwd_warning,@not_encrypted_warning,
 		      $welcome_text);
       }
     elsif ($welcome_type eq "file")
@@ -4630,7 +4922,18 @@ sub _PASS_command
 		"but the file is missing." );
 	  }
 
-	$self->reply (230, @anon_passwd_warning, @lines);
+	$self->reply (230, @anon_passwd_warning, @not_encrypted_warning,@lines);
+      }
+    elsif ($welcome_type eq "hook")
+      {
+      my @welcome_text = $self->welcome_hook($self->{user});
+      my @lines;
+      foreach my $line (@welcome_text) {
+        push @lines, $self->_percent_substitutions ($line);
+      }
+      $self->reply (230,
+		      @anon_passwd_warning,@not_encrypted_warning,
+		      @lines);
       }
     else
       {
@@ -4749,6 +5052,7 @@ sub _percent_substitutions
     s/%U/$self->{user}/ge;
     s/%u/$self->{user}/ge;
     s/%x/$self->{_max_clients}/ge;
+    s/%y/$self->{_max_clients_per_ip}/ge;
     s/%%/%/g;
 
     return $_;
@@ -4916,7 +5220,7 @@ sub _CDUP_command
     if (my $new_cwd = $self->_chdir ($self->{cwd}, ".."))
       {
         # Access control
-        unless ($self->_eval_rule ("chdir rule",
+	    unless ($self->_eval_rule ("chdir rule",
                                    $new_cwd->pathname, $new_cwd->filename,
                                    $new_cwd->pathname))
           {
@@ -5040,12 +5344,20 @@ sub _PORT_command
     # Construct host address.
     my $hostaddrstring = "$a1.$a2.$a3.$a4";
 
+    unless (!$self->config ("require passive data connection"))
+      {
+            $self->log ("info","Active Data connection attempted with hostaddrstring %s \n",$hostaddrstring);
+	    $self->reply (504, "Only PASSIVE FTP is allowed on this server. Please use PASV mode and/or update your FTP client.");
+	    return;
+      }
+
     # Are we connecting back to the client?
     unless ($self->config ("allow proxy ftp"))
       {
 	if (!$self->{_test_mode} && $hostaddrstring ne $self->{peeraddrstring})
 	  {
 	    # See RFC 2577 section 3.
+            $self->log ("info","Proxy FTP attempted with hostaddrstring %s peeraddrstring %s\n",$hostaddrstring, $self->{peeraddrstring});
 	    $self->reply (504, "Proxy FTP is not allowed on this server.");
 	    return;
 	  }
@@ -5078,6 +5390,197 @@ sub _PORT_command
 
     $self->reply (200, "PORT command OK.");
   }
+
+sub _EPRT_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    #  m{\(([\x33-\x7e])\1\1(\d+)\1\)} is an interesting way to match
+
+    unless ($rest=~ m{([\x33-\x7e])(\d)\1(.*)\1(\d+)}) {
+	$self->reply (501, "Syntax error in EPRT command.");
+	return;
+     }
+    my $proto_family = int ($2);
+    my $addr = $3;
+    my $port = int ($4);
+    unless ($proto_family == 1) {
+	$self->reply (522, "This server only supports IPv4 addresses");
+	return;
+     }
+
+    unless ($addr =~ /^\s*((\d{1,3}).\s*(\d{1,3}).\s*(\d{1,3}).\s*(\d{1,3}))/)
+      {
+	$self->reply (501, "Invalid host address.");
+	return;
+      }
+
+    my $a1 = int ($1);
+    my $a2 = int ($2);
+    my $a3 = int ($3);
+    my $a4 = int ($4);
+
+
+    # Check host address.
+    unless ($a1 > 0 && $a1 < 224 &&
+	    $a2 >= 0 && $a2 < 256 &&
+	    $a3 >= 0 && $a3 < 256 &&
+	    $a4 >= 0 && $a4 < 256)
+      {
+	$self->reply (501, "Invalid host address.");
+	return;
+      }
+
+    # Construct host address.
+    my $hostaddrstring = "$a1.$a2.$a3.$a4";
+
+    # Are we connecting back to the client?
+    unless ($self->config ("allow proxy ftp"))
+      {
+	if (!$self->{_test_mode} && $hostaddrstring ne $self->{peeraddrstring})
+	  {
+	    # See RFC 2577 section 3.
+	    $self->reply (504, "Proxy FTP is not allowed on this server.");
+	    return;
+	  }
+      }
+
+    # Construct port number.
+    my $hostport = $port; # $p1 * 256 + $p2;
+
+    # Check port number.
+    unless ($hostport > 0 && $hostport < 65536)
+      {
+	$self->reply (501, "Invalid port number.");
+      }
+
+    # Allow connections back to ports < 1024?
+    unless ($self->config ("allow connect low port"))
+      {
+	if ($hostport < 1024)
+	  {
+	    # See RFC 2577 section 3.
+	    $self->reply (504, "This server will not connect back to ports < 1024.");
+	    return;
+	  }
+      }
+
+    $self->{_hostaddrstring} = $hostaddrstring;
+    $self->{_hostaddr} = inet_aton ($hostaddrstring);
+    $self->{_hostport} = $hostport;
+    $self->{_passive} = 0;
+
+    $self->reply (200, "PORT command OK.");
+  }
+
+sub _EPSV_command
+  {
+    my $self = shift;
+    my $cmd = shift;
+    my $rest = shift;
+
+    my $proto = 1;
+    # EPSV takes an optional argument of the network protocol, or ALL
+    unless (($rest eq '') || ($rest =~ /^((\d)|(ALL))$/)) {
+	$self->reply (501, "Invalid syntax.[$cmd $rest]");
+	return;
+   }
+   if ($1 eq 'ALL') { # need to reject other commands!
+
+   }
+   my $port_range = $self->config ("passive port range");
+   $port_range = "49152-65535" unless defined $port_range;
+
+    my $sock;
+
+    if ($port_range eq "0")
+      {
+	# Use the standard kernel determined ephemeral port
+	# by leaving off LocalPort parameter.
+	"0" =~ /(0)/; # Perl 5.7 / IO::Socket::INET bug workaround.
+	$sock = IO::Socket::INET->new
+	  (Listen => 1,
+	   LocalAddr => $self->{sockaddrstring},
+	   Reuse => 1,
+	   Proto => "tcp",
+	   Type => SOCK_STREAM);
+      }
+    else
+      {
+	# Parse the $port_range string and assign a port from the
+	# range at random.
+	my @ranges = split /\s*,\s*/, $port_range;
+	my $total_width = 0;
+	foreach (@ranges)
+	  {
+	    my ($min, $max) = split /\s*-\s*/, $_;
+	    $_ = [ $min, $max, $max - $min + 1 ];
+	    $total_width += $_->[2];
+	  }
+
+	# XXX We need to use a secure source of random numbers here, otherwise
+	# this is a little bit pointless.
+	my $count = 100;
+
+	until (defined $sock || --$count == 0)
+	  {
+	    my $n = int (rand $total_width);
+	    my $port;
+	    foreach (@ranges)
+	      {
+		if ($n < $_->[2])
+		  {
+		    $port = $_->[0] + $n;
+		    last;
+		  }
+		$n -= $_->[2];
+	      }
+
+	    "0" =~ /(0)/; # Perl 5.7 / IO::Socket::INET bug workaround.
+	    $sock = IO::Socket::INET->new
+	      (Listen => 1,
+	       LocalAddr => $self->{sockaddrstring},
+	       LocalPort => $port,
+	       Reuse => 1,
+	       Proto => "tcp",
+	       Type => SOCK_STREAM);
+	  }
+      }
+
+    unless ($sock)
+      {
+	# Return a code 550 here, even though this is not in the RFC. XXX
+	$self->reply (550, "Can't open a listening socket.");
+	return;
+      }
+
+    $self->{_passive} = 1;
+    $self->{_passive_sock} = $sock;
+
+    # Get our port number.
+    my $sockport = $sock->sockport;
+
+    unless ($self->{_test_mode})
+      {
+	my $sockaddrstring = $self->{public_ip_address} || $self->{sockaddrstring};
+
+	# We will need to revise this for IPv6 XXX
+	die
+	  unless $sockaddrstring =~ /^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$/;
+
+	# Be very precise about this error message, since most clients
+	# will have to parse the whole of it.
+	$self->reply (229, "Entering Extended Passive Mode (|||$sockport|)");
+      }
+    else
+      {
+	# Test mode: connect back to localhost.
+	$self->reply (229, "Entering Extended Passive Mode (|||$sockport|)");
+      }
+  }
+
 
 sub _PASV_command
   {
@@ -5170,7 +5673,7 @@ sub _PASV_command
 
     unless ($self->{_test_mode})
       {
-	my $sockaddrstring = $self->{sockaddrstring};
+	my $sockaddrstring = $self->{public_ip_address} || $self->{sockaddrstring};
 
 	# We will need to revise this for IPv6 XXX
 	die
@@ -5375,6 +5878,11 @@ sub _RETR_command
 		  " data connection for file $filename.");
 
     # Open a path back to the client.
+
+    if (!($self->{_passive}) && ($self->config ("require passive data connection"))){
+	$self->reply (425, "Can't open data connection. Connections must be in PASSIVE mode.");
+	return;
+    }
     my $sock = $self->open_data_connection;
 
     unless ($sock)
@@ -5387,17 +5895,17 @@ sub _RETR_command
     my @filter_objects;
     foreach (@filters)
       {
-	my $filter = &$_ ($self, $sock);
+        my $filter = &$_ ($self, $sock);
 
 	unless ($filter)
 	  {
 	    $self->reply (500, "Can't open filter program in archive mode.");
-	    close $sock;
+	    $self->close_data_connection($sock);
 	    $self->_cleanup_filters (@filter_objects);
 	    return;
 	  }
 
-	unshift @filter_objects, $filter;
+        unshift @filter_objects, $filter;
 	$sock = $filter->{sock};
       }
 
@@ -5420,7 +5928,13 @@ sub _RETR_command
 	    # in Perl >= 5.6, SEEK_CUR is exported by both IO::Seekable
 	    # and Fcntl. Hence we 'use IO::Seekable' at the top of the
 	    # file to get this symbol reliably in both cases.
-	    $file->sysseek ($self->{_restart}, SEEK_CUR);
+	    if (defined($file->sysseek ($self->{_restart}, SEEK_SET))) {
+	        $self->{_restart} = 0;
+	    } else {
+	       $self->log ("info","sysseek failed, discarding instead of seeking"); # this may be a pipe instead of a file
+	       my $discard_count = $self->{_restart};
+	       $self->discardFileBytes($file, $discard_count);
+	    }
 	    $self->{_restart} = 0;
 	  }
 
@@ -5435,7 +5949,7 @@ sub _RETR_command
 	    if ($transfer_hook
 		= $self->transfer_hook ("r", $file, $sock, \$buffer))
 	      {
-		close $sock;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->_cleanup_filters (@filter_objects);
 		$self->reply (426,
@@ -5454,7 +5968,7 @@ sub _RETR_command
 		    # There was an error.
 		    my $reason = $self->system_error_hook();
 
-		    close $sock;
+		    $self->close_data_connection($sock);
 		    $file->close;
 		    $self->_cleanup_filters (@filter_objects);
 		    $self->reply (426,
@@ -5471,7 +5985,7 @@ sub _RETR_command
 	    # Transfer aborted by client?
 	    if ($self->{_urgent})
 	      {
-		close $sock;
+	        $self->close_data_connection($sock);
 		$file->close;
 		$self->_cleanup_filters (@filter_objects);
 		$self->reply (426, "Transfer aborted. Data connection closed.");
@@ -5485,7 +5999,7 @@ sub _RETR_command
 	    # There was an error.
 	    my $reason = $self->system_error_hook();
 
-	    close $sock;
+	    $self->close_data_connection($sock);
 	    $file->close;
 	    $self->_cleanup_filters (@filter_objects);
 	    $self->reply (426,
@@ -5519,7 +6033,7 @@ sub _RETR_command
 
 	    if ($transfer_hook = $self->transfer_hook ("r", $file, $sock, \$_))
 	      {
-		close $sock;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->_cleanup_filters (@filter_objects);
 		$self->reply (426,
@@ -5534,7 +6048,7 @@ sub _RETR_command
 	    $sock->print ("$_\r\n");
 	    if ($self->{_urgent})
 	      {
-		close $sock;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->_cleanup_filters (@filter_objects);
 		$self->reply (426, "Transfer aborted. Data connection closed.");
@@ -5544,7 +6058,7 @@ sub _RETR_command
 	  }
       }
 
-    unless (close ($sock) && $file->close)
+    unless ($self->close_data_connection($sock) && $file->close)
       {
 	my $reason = $self->system_error_hook();
 	$self->reply (550, "File retrieval error: $reason");
@@ -5861,6 +6375,15 @@ sub _LIST_command
 	return;
       }
 
+    # check that we're allowing active connections
+
+    if (!($self->{_passive}) && ($self->config ("require passive data connection"))) {
+	$self->reply (425, "Can't open data connection. Connections must be in PASSIVE mode.");
+	return;
+    }
+
+
+
     $self->reply (150, "Opening data connection for file listing.");
 
     # Open a path back to the client.
@@ -5882,6 +6405,7 @@ sub _LIST_command
 
     # OK, we're either listing a full directory, listing a single
     # file or listing a wildcard.
+
     if ($fileh)			# Single file in $dirh.
       {
 	$self->_list_file ($sock, $fileh, $prefix . $filename);
@@ -5897,8 +6421,7 @@ sub _LIST_command
 	  }
 
 	my $r = $dirh->_list_status ($wildcard);
-
-	foreach (@$r)
+        foreach (@$r)
 	  {
 	    my $filename = $_->[0];
 	    my $handle = $_->[1];
@@ -5908,7 +6431,7 @@ sub _LIST_command
 	  }
       }
 
-    unless ($sock->close)
+    unless ($self->close_data_connection($sock))
       {
 	$self->reply (550, "Error closing data connection: $!");
 	return;
@@ -5956,6 +6479,13 @@ sub _NLST_command
 	return;
       }
 
+    # check that we're allowing active connections
+
+    if (!($self->{_passive}) && ($self->config ("require passive data connection"))) {
+	$self->reply (425, "Can't open data connection. Connections must be in PASSIVE mode.");
+	return;
+    }
+
     $self->reply (150, "Opening data connection for file listing.");
 
     # Open a path back to the client.
@@ -5995,7 +6525,7 @@ sub _NLST_command
 	  }
       }
 
-    unless ($sock->close)
+    unless ($self->close_data_connection($sock))
       {
 	$self->reply (550, "Error closing data connection: $!");
 	return;
@@ -6556,21 +7086,21 @@ sub _FEAT_command
     # wu-ftpd by putting the server code in each line).
     #
     # See RFC 2389 section 3.2.
-    print "211-Extensions supported:\r\n";
+    $self->{_sock}->print("211-Extensions supported:\r\n");
 
     foreach (sort keys %{$self->{features}})
       {
 	unless ($self->{features}{$_})
 	  {
-	    print " $_\r\n";
+	    $self->{_sock}->print(" $_\r\n");
 	  }
 	else
 	  {
-	    print " $_ ", $self->{features}{$_}, "\r\n";
+	    $self->{_sock}->print(" $_ ", $self->{features}{$_}, "\r\n");
 	  }
       }
 
-    print "211 END\r\n";
+    $self->{_sock}->print("211 END\r\n");
   }
 
 sub _OPTS_command
@@ -6743,8 +7273,9 @@ sub _MLST_command
     # If not file name is given, then we need to return
     # status on the current directory. Else we return
     # status on the file or directory name given.
-    my $fileh;
+
     my $dirh = $self->{cwd};
+    my $fileh;
     my $filename = ".";
 
     if ($rest ne "")
@@ -6774,9 +7305,9 @@ sub _MLST_command
     my $info = $self->_mlst_format ($filename, $fileh, $dirh);
 
     # Can't use $self->reply since it produces the wrong format.
-    print "250-Listing of $filename:\r\n";
-    print " ", $info, "\r\n";
-    print "250 End of listing.\r\n";
+    $self->{_sock}->print("250-Listing of $filename:\r\n");
+    $self->{_sock}->print(" ", $info, "\r\n");
+    $self->{_sock}->print("250 End of listing.\r\n");
   }
 
 sub _MLSD_command
@@ -6803,6 +7334,11 @@ sub _MLSD_command
 	$self->reply (550, "MLSD command denied by server configuration.");
 	return;
       }
+
+    if (!($self->{_passive}) && ($self->config ("require passive data connection"))) {
+	$self->reply (425, "Can't open data connection. Connections must be in PASSIVE mode.");
+	return;
+    }
 
     $self->reply (150, "Opening data connection for file listing.");
 
@@ -6842,7 +7378,7 @@ sub _MLSD_command
 	  }
       }
 
-    unless ($sock->close)
+    unless ($self->close_data_connection($sock))
       {
 	$self->reply (550, "Error closing data connection: $!");
 	return;
@@ -7377,6 +7913,14 @@ Open a data connection. Returns the socket (an instance of C<IO::Socket>) or und
 
 =cut
 
+sub close_data_connection
+  {
+      my $self = shift;
+      my $sock = shift;
+
+      return $sock->close;
+  }
+
 sub open_data_connection
   {
     my $self = shift;
@@ -7465,6 +8009,26 @@ sub open_data_connection
 	  or warn "setsockopt: SO_RCVBUF: $!";
       }
 
+    # Data connections are PROTected, enable SSL
+    if ($self->{tls_data}) 
+      {
+        my $cert = $self->config("ssl cert file") || $self->config("ssl certificate file");
+        my $key = $self->config("ssl key file");
+        if (IO::Socket::SSL->start_SSL($sock, 
+                                       SSL_server => 1, 
+                                       SSL_cert_file => $cert,
+                                       SSL_key_file => $key,
+                                      ))
+          {
+            # yay, all good
+          }
+        else
+          {
+            # failed, what can we do?
+            die "Failed to start TLS connection"; # woot
+          }
+      }
+
     return $sock;
   }
 
@@ -7477,11 +8041,8 @@ sub _list_file
     my $self = shift;
     my $sock = shift;
     my $fileh = shift;
-    my $filename = shift;
+    my $filename = shift || $fileh->filename;
     my $statusref = shift;
-
-    $filename = $fileh->filename
-      if $filename eq '';
 
     # Get the status information.
     my @status;
@@ -7491,6 +8052,10 @@ sub _list_file
     # Break out the fields of the status information.
     my ($mode, $perms, $nlink, $user, $group, $size, $mtime) = @status;
 
+    if (!defined($mtime)) {
+	 $self->log ("warn", "NO MTIME FOR $filename\n");
+	 $mtime = 0;
+    }
     # Generate printable date (this logic is taken from GNU fileutils:
     # src/ls.c: print_long_format).
     my $time = time;
@@ -7563,8 +8128,7 @@ sub _store
       {
 	# Get the directory.
 	($dirh, $fileh, $filename) = $self->_get ($path);
-
-	unless ($dirh)
+        unless ($dirh)
 	  {
 	    $self->reply (550, "File or directory not found.");
 	    return;
@@ -7574,7 +8138,7 @@ sub _store
       {
 	$dirh = $self->{cwd};
 
-	# Choose a unique name for this file.
+        # Choose a unique name for this file.
 	my $i = 0;
 	while ($dirh->get ("X$i")) {
 	  $i++;
@@ -7594,16 +8158,32 @@ sub _store
 
     # Are we trying to overwrite a previously existing file?
     if (! $append &&
-	defined $fileh &&
-	defined $self->config ("allow store to overwrite") &&
-	! $self->config ("allow store to overwrite"))
+	  defined $fileh &&
+	  defined $self->config ("allow store to overwrite") &&
+	  ! $self->config ("allow store to overwrite"))
       {
 	$self->reply (550, "Cannot rename file.");
 	return;
       }
+    #
+    # does the file exist?
+    #
 
-    # Try to open the file.
-    my $file = $dirh->open ($filename, ($append ? "a" : "w"));
+    if (defined $fileh && $self->{_restart})
+      {
+        my ($mode, $perms, $nlink, $user, $group, $size, $time)
+                    = $fileh->status;
+        $self->log ("warn", "Restarting STOR for $filename @ $self->{_restart}, size is $size\n");
+        # see if _restart value is greater than size of the file. error if it is.
+        #
+        if ($size < $self->{_restart})
+          {
+            $self->reply (550, "Restart point $self->{_restart} invalid for file size $size.");
+            return;
+          }
+      }
+    # Try to open the file.  Use Append mode if _restart has stuff to do
+    my $file = $dirh->open ($filename, (($append || $self->{_restart}) ? "a" : "w"));
 
     unless ($file)
       {
@@ -7623,6 +8203,18 @@ sub _store
 	# RFC 1123 section 4.1.2.9.
 	$self->reply (150, "FILE: $filename");
       }
+    # Handle REST - note that this assumes there's a file open on the local disk already.
+    if ($self->{_restart})
+    {
+        $self->log ("warn", "This is where we read the existing file into the existing file\n");
+        my $pos;
+        unless (defined($pos = $file->sysseek ($self->{_restart}, SEEK_SET)))
+        {
+          $self->reply (550, "Cannot RESTart upload.");
+          return;
+        }
+        $self->log ("warn", "Now at position $pos\n");
+    }
 
     # Open a path back to the client.
     my $sock = $self->open_data_connection;
@@ -7654,7 +8246,7 @@ sub _store
 	    if ($transfer_hook
 		= $self->transfer_hook ("w", $file, $sock, \$buffer))
 	      {
-		$sock->close;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->reply (426,
 			      "File store error: $transfer_hook",
@@ -7671,7 +8263,7 @@ sub _store
 		    # There was an error.
 		    my $reason = $self->system_error_hook();
 
-		    $sock->close;
+		    $self->close_data_connection($sock);
 		    $file->close;
 		    $self->reply (426,
 				  "File store error: $reason",
@@ -7688,7 +8280,7 @@ sub _store
 	    # There was an error.
 	    my $reason = $self->system_error_hook();
 
-	    $sock->close;
+	    $self->close_data_connection($sock);
 	    $file->close;
 	    $self->reply (426,
 			  "File store error: $reason",
@@ -7713,7 +8305,7 @@ sub _store
 
 	    if ($transfer_hook = $self->transfer_hook ("w", $file, $sock, \$_))
 	      {
-		$sock->close;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->reply (426,
 			      "File store error: $transfer_hook",
@@ -7727,7 +8319,7 @@ sub _store
 	      {
 		my $reason = $self->system_error_hook();
 		# There was an error.
-		$sock->close;
+		$self->close_data_connection($sock);
 		$file->close;
 		$self->reply (426,
 			      "File store error: $reason",
@@ -7737,16 +8329,61 @@ sub _store
 	  }
       }
 
-    unless ($sock->close && $file->close)
+    unless ($self->close_data_connection($sock) && $file->close)
       {
 	my $reason = $self->system_error_hook();
-	$self->reply (550, "File retrieval error: $reason");
+	$self->reply (550, "File store error: $reason");
 	return;
       }
 
     $self->xfer_complete if $self->{_xferlog};
     $self->reply (226, "File store complete. Data connection has been closed.");
   }
+
+  sub _determine_public_ipaddress
+  {
+      my $param = shift;
+      my $public_address;
+
+      if ($param =~ /^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$/) {
+          $public_address = "$1.$2.$3.$4";
+      }
+      elsif ( $param =~ /^ec2-public-ip-address$/ ) {
+          my $ec2_hostname = `curl -s http://169.254.169.254/latest/meta-data/public-ipv4`;
+          if ($ec2_hostname =~ /^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$/) {
+              $public_address = "$1.$2.$3.$4";
+          }
+          else {
+              die "Can't resolve ec2 external  address ".$ec2_hostname ;
+          }
+      } else { # must look it up...
+           my $external_ipaddr = gethostbyname ($param);
+           die "Can't resolve public ip address ".$param if (!$external_ipaddr);
+           $public_address = inet_ntoa($external_ipaddr);
+      }
+  }
+
+  sub discardFileBytes
+    {
+      my $self = shift;
+      my $file = shift;
+      my $discard_count = shift;
+      my $buffer;
+
+      DISCARDIFYING:
+        {
+  	    while ($discard_count > 0) {
+  	      my $discarded = $file->sysread($buffer, $discard_count < 65536 ? $discard_count : 65536);
+  	      if ($discarded == 0) {  #
+  	        $self->log ("info","couldn't discard!");
+  	        last DISCARDIFYING;
+  	      }
+  	      $discard_count -= $discarded;
+  	    }
+        }
+    }
+
+
 
 =pod
 
@@ -8069,7 +8706,7 @@ cases such as:
 Unfortunately it is not in general easily possible to catch these
 cases and cleanly call a hook. If your personality needs to do cleanup
 in all cases, then it is probably better to use an C<END> block inside
-your Server object (see C<perlmod(3)>). Even using an C<END> block
+your Server object (see L<perlmod(3)>). Even using an C<END> block
 cannot catch cases where the Perl interpreter crashes.
 
 Status: optional.
@@ -8114,14 +8751,14 @@ sub _newFromFileHandle
     $self->fileName ($filename);
     $self->{externalFileName} = $filename;
 
-    $self->{compressionMethod} = &Archive::Zip::COMPRESSION_STORED;
+    $self->{compressionMethod} = &{$ {Archive::Zip::}{COMPRESSION_STORED}};
 
     my ($mode, $perms, $nlink, $user, $group, $size, $time) = $fileh->status;
     $self->{compressedSize} = $self->{uncompressedSize} = $size;
     $self->desiredCompressionMethod
       ($self->compressedSize > 0
-       ? &Archive::Zip::COMPRESSION_DEFLATED
-       : &Archive::Zip::COMPRESSION_STORED);
+       ? &{$ {Archive::Zip::}{COMPRESSION_DEFLATED}}
+       : &{$ {Archive::Zip::}{COMPRESSION_STORED}});
     $self->unixFileAttributes ($perms);
     $self->setLastModFileDateTimeFromUnix ($time) if $time > 0;
     $self->isTextFile (0);
@@ -8141,7 +8778,7 @@ sub fh
     return $self->{fh} if $self->{fh};
 
     $self->{fh} = $self->{fileh}->open ("r")
-      or return &Archive::Zip::AZ_IO_ERROR;
+      or return &{$ {Archive::Zip::}{AZ_IO_ERROR}};
 
     $self->{fh};
   }
@@ -8151,17 +8788,17 @@ sub rewindData
     my $self = shift;
 
     my $status = $self->SUPER::rewindData (@_);
-    return $status if $status != &Archive::Zip::AZ_OK;
+    return $status if $status != &{$ {Archive::Zip::}{AZ_OK}};
 
-    return &Archive::Zip::AZ_IO_ERROR unless $self->fh;
+    return &{$ {Archive::Zip::}{AZ_IO_ERROR}} unless $self->fh;
 
     # Not all personalities can seek backwards in the stream. Close
     # the file and reopen it instead.
-    $self->endRead == &Archive::Zip::AZ_OK
-      or return &Archive::Zip::AZ_IO_ERROR;
+    $self->endRead == &{$ {Archive::Zip::}{AZ_OK}}
+      or return &{$ {Archive::Zip::}{AZ_IO_ERROR}};
     $self->fh;
 
-    return &Archive::Zip::AZ_OK;
+    return &{$ {Archive::Zip::}{AZ_OK}};
   }
 
 sub _readRawChunk
@@ -8170,12 +8807,12 @@ sub _readRawChunk
     my $dataref = shift;
     my $chunksize = shift;
 
-    return (0, &Archive::Zip::AZ_OK) unless $chunksize;
+    return (0, &{$ {Archive::Zip::}{AZ_OK}}) unless $chunksize;
 
     my $bytesread = $self->fh->sysread ($$dataref, $chunksize)
-      or return (0, &Archive::Zip::AZ_IO_ERROR);
+      or return (0, &{$ {Archive::Zip::}{AZ_IO_ERROR}});
 
-    return ($bytesread, &Archive::Zip::AZ_OK);
+    return ($bytesread, &{$ {Archive::Zip::}{AZ_OK}});
   }
 
 sub endRead
@@ -8185,28 +8822,27 @@ sub endRead
     if ($self->{fh})
       {
 	$self->{fh}->close
-	  or return &Archive::Zip::AZ_IO_ERROR;
+	  or return &{$ {Archive::Zip::}{AZ_IO_ERROR}};
 	delete $self->{fh};
       }
-    return &Archive::Zip::AZ_OK;
+    return &{$ {Archive::Zip::}{AZ_OK}};
   }
 
 1 # So that the require or use succeeds.
 
 __END__
 
-=back
+=back 4
+
 
 =head1 BUGS
 
 The SIZE, REST and RETR commands probably do not work correctly
 in ASCII mode.
 
-REST does not work before STOR/STOU/APPE (is it supposed to?)
+REST may not work before STOR/STOU/APPE.
 
 User upload/download limits.
-
-Limit number of clients by host or IP address.
 
 The following commands are recognized by C<wu-ftpd>, but are not yet
 implemented by C<Net::FTPServer>:
@@ -8241,10 +8877,6 @@ Support for IPv6 (see RFC 2428), EPRT, EPSV commands.
 
 See also "XXX" comments in the code for other problems, missing features
 and bugs.
-
-=head1 DEPENDENCY
-
-IO::Dir, IO::stringy
 
 =head1 AUTHORS
 
@@ -8289,17 +8921,18 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 C<Net::FTPServer::Handle(3)>,
 C<Net::FTPServer::FileHandle(3)>,
 C<Net::FTPServer::DirHandle(3)>,
-C<Net::FTP(3)>,
+CNet::FTP(3)>,
 C<perl(1)>,
 RFC 765,
 RFC 959,
 RFC 1579,
+RFC 2228,
 RFC 2389,
 RFC 2428,
 RFC 2577,
 RFC 2640,
+RFC 4217,
 Extensions to FTP Internet Draft draft-ietf-ftpext-mlst-NN.txt.
-L<Net::FTPServer::XferLog>
-L<Test::FTP::Server>
-
+C<Net::FTPServer::XferLog>
+C<Test::FTP::Server>
 =cut
